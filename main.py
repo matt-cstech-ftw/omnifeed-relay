@@ -1,6 +1,7 @@
 ﻿import os
 import asyncio
 import json
+import http
 import websockets
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
@@ -10,6 +11,24 @@ ALLOWED_ORIGINS = {
     "http://localhost",
     "http://127.0.0.1",
 }
+
+async def process_request(connection, request):
+    # Respond with 200 OK to plain HTTP pings (UptimeRobot, health checks)
+    if request.headers.get("Upgrade", "").lower() != "websocket":
+        response_body = b'{"status": "ok", "service": "omnifeed-relay"}'
+        headers = [
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(response_body))),
+            ("Connection", "close"),
+        ]
+        return connection.respond(http.HTTPStatus.OK, headers, response_body)
+
+    # Origin guard for WebSockets
+    origin = request.headers.get("Origin", "")
+    if origin and not any(origin.startswith(allowed) for allowed in ALLOWED_ORIGINS):
+        return connection.respond(http.HTTPStatus.FORBIDDEN, [("Connection", "close")], b"Forbidden")
+
+    return None
 
 async def handler(websocket):
     client = None
@@ -78,7 +97,12 @@ async def handler(websocket):
 
 async def main():
     port = int(os.environ.get("PORT", 8080))
-    async with websockets.serve(handler, "0.0.0.0", port):
+    async with websockets.serve(
+        handler,
+        "0.0.0.0",
+        port,
+        process_request=process_request,
+    ):
         await asyncio.Future()
 
 if __name__ == "__main__":
