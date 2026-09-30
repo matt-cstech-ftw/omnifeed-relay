@@ -5,6 +5,9 @@ from aiohttp import web
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 
+# Preshared access key
+AUTH_KEY = os.environ.get("RELAY_AUTH_KEY", "#hogcranked")
+
 async def health_check(request):
     return web.json_response({"status": "ok", "service": "omnifeed-relay"})
 
@@ -13,6 +16,11 @@ async def websocket_handler(request):
     origin = request.headers.get("Origin", "")
     if origin and ("github.io" not in origin and "localhost" not in origin and "127.0.0.1" not in origin):
         return web.Response(status=403, text="Forbidden")
+
+    # Validate secret token query
+    token = request.query.get("token", "")
+    if token != AUTH_KEY:
+        return web.Response(status=401, text="Unauthorized: Invalid Secret Key")
 
     ws = web.WebSocketResponse(heartbeat=25.0)
     await ws.prepare(request)
@@ -88,11 +96,8 @@ async def websocket_handler(request):
 
 def create_app():
     app = web.Application()
-    # Health checks on GET /
     app.router.add_get("/", health_check)
-    # WebSocket route on /ws
     app.router.add_get("/ws", websocket_handler)
-    # Direct fallback for root connections
     app.router.add_get("", websocket_handler)
     return app
 
