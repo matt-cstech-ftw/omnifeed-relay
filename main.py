@@ -5,21 +5,16 @@ from aiohttp import web
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 
-ALLOWED_ORIGINS = {
-    "https://matt-cstech-ftw.github.io",
-    "http://localhost",
-    "http://127.0.0.1",
-}
-
 async def health_check(request):
     return web.json_response({"status": "ok", "service": "omnifeed-relay"})
 
 async def websocket_handler(request):
+    # Allow connections from github.io, localhost, or direct app clients
     origin = request.headers.get("Origin", "")
-    if origin and not any(origin.startswith(allowed) for allowed in ALLOWED_ORIGINS):
+    if origin and ("github.io" not in origin and "localhost" not in origin and "127.0.0.1" not in origin):
         return web.Response(status=403, text="Forbidden")
 
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(heartbeat=25.0)
     await ws.prepare(request)
 
     client = None
@@ -93,14 +88,12 @@ async def websocket_handler(request):
 
 def create_app():
     app = web.Application()
+    # Health checks on GET /
     app.router.add_get("/", health_check)
+    # WebSocket route on /ws
     app.router.add_get("/ws", websocket_handler)
-    # Catch-all to allow connecting directly to the root websocket URL
-    async def route_selector(request):
-        if request.headers.get("Upgrade", "").lower() == "websocket":
-            return await websocket_handler(request)
-        return await health_check(request)
-    app.router.add_route("*", "/{tail:.*}", route_selector)
+    # Direct fallback for root connections
+    app.router.add_get("", websocket_handler)
     return app
 
 if __name__ == "__main__":
