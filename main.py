@@ -5,6 +5,12 @@ import websockets
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 
+ALLOWED_ORIGINS = {
+    "https://matt-cstech-ftw.github.io",
+    "http://localhost",
+    "http://127.0.0.1",
+}
+
 async def handler(websocket):
     client = None
     task = None
