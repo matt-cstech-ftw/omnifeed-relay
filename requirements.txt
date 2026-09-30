@@ -1,2 +1,2 @@
 ﻿TikTokLive
-websockets
+aiohttp
