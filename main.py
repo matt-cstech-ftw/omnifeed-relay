@@ -13,9 +13,14 @@ async def health_check(request):
     return web.json_response({"status": "ok", "service": "omnifeed-relay"})
 
 async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: str) -> str | None:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    # 1. Webcast profile endpoint
     try:
         url = f"https://webcast.tiktok.com/webcast/user/profile/?user_id={user_id}&aid=1988"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 body = await resp.text()
                 try:
@@ -33,9 +38,10 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
     except Exception:
         pass
 
+    # 2. Web page fallback
     try:
         url = f"https://www.tiktok.com/@{user_id}"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 body = await resp.text()
                 m = re.search(r'"uniqueId":"([^"]+)"', body)
@@ -43,6 +49,41 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
                     return m.group(1)
     except Exception:
         pass
+
+    return None
+
+def extract_client_room_id(client: TikTokLiveClient) -> str | None:
+    """Extracts room_id regardless of how TikTokLive stores it."""
+    # 1. client.room (standard in v6+)
+    room_obj = getattr(client, "room", None)
+    if room_obj:
+        r_id = getattr(room_obj, "room_id", None) or getattr(room_obj, "id", None)
+        if r_id:
+            return str(r_id)
+        if isinstance(room_obj, dict):
+            r_id = room_obj.get("room_id") or room_obj.get("id")
+            if r_id:
+                return str(r_id)
+
+    # 2. client.room_info
+    room_info = getattr(client, "room_info", None)
+    if isinstance(room_info, dict):
+        r_id = room_info.get("room_id") or room_info.get("id")
+        if r_id:
+            return str(r_id)
+
+    # 3. Direct attributes
+    for attr in ("room_id", "_room_id"):
+        val = getattr(client, attr, None)
+        if val:
+            return str(val)
+
+    # 4. web client session cache
+    web_obj = getattr(client, "web", None)
+    if web_obj:
+        val = getattr(web_obj, "room_id", None)
+        if val:
+            return str(val)
 
     return None
 
@@ -54,8 +95,8 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
     prompted_hosts = set()
     clean_lower = handle.lower().replace("@", "").strip()
 
-    # Wait up to 10 seconds for connection
-    for _ in range(20):
+    # Wait up to 15 seconds for connection
+    for _ in range(30):
         if client.connected:
             break
         await asyncio.sleep(0.5)
@@ -63,27 +104,19 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
     if not client.connected:
         return
 
-    # Extract room_id from available client attributes
-    room_id = getattr(client, "room_id", None)
-    if not room_id and hasattr(client, "room_info") and isinstance(client.room_info, dict):
-        room_id = client.room_info.get("room_id") or client.room_info.get("id")
+    # Keep polling room_id if not immediately ready
+    room_id = None
+    for _ in range(20):
+        room_id = extract_client_room_id(client)
+        if room_id:
+            break
+        await asyncio.sleep(0.5)
+
+    print(f"[COHOST] Monitoring started for @{clean_lower}. Room ID: {room_id}", flush=True)
+    if not room_id:
+        return
 
     async with aiohttp.ClientSession(headers=headers) as session:
-        # Fallback to webpage extraction if client didn't expose room_id
-        if not room_id:
-            try:
-                async with session.get(f"https://www.tiktok.com/@{clean_lower}/live", timeout=aiohttp.ClientTimeout(total=4)) as r:
-                    if r.status == 200:
-                        txt = await r.text()
-                        m = re.search(r'"roomId":"(\d+)"', txt)
-                        if m:
-                            room_id = m.group(1)
-            except Exception:
-                pass
-
-        if not room_id:
-            return
-
         while client.connected and not ws.closed:
             try:
                 url = f"https://webcast.tiktok.com/webcast/room/info/?room_id={room_id}&aid=1988"
@@ -95,15 +128,35 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
 
                         owner_id = str(data.get("owner", {}).get("id") or data.get("owner_user_id") or "")
                         link_mic = data.get("link_mic") or data.get("linkMic") or {}
-                        battle_scores = link_mic.get("battle_scores") or link_mic.get("battleScores") or []
 
-                        rival_user_ids = []
+                        rival_user_ids = set()
+
+                        # 1. Battle scores
+                        battle_scores = link_mic.get("battle_scores") or link_mic.get("battleScores") or []
                         if isinstance(battle_scores, list):
                             for score_entry in battle_scores:
                                 if isinstance(score_entry, dict):
                                     u_id = str(score_entry.get("user_id") or score_entry.get("userId") or "")
                                     if u_id and u_id != owner_id:
-                                        rival_user_ids.append(u_id)
+                                        rival_user_ids.add(u_id)
+
+                        # 2. Co-host user list / rival users (Co-host box mode)
+                        rival_users = link_mic.get("rival_users") or link_mic.get("rivalUsers") or []
+                        if isinstance(rival_users, list):
+                            for ru in rival_users:
+                                if isinstance(ru, dict):
+                                    u_id = str(ru.get("id") or ru.get("user_id") or "")
+                                    if u_id and u_id != owner_id:
+                                        rival_user_ids.add(u_id)
+
+                        # 3. Linked users
+                        linked_users = link_mic.get("linked_users") or link_mic.get("linkedUsers") or []
+                        if isinstance(linked_users, list):
+                            for lu in linked_users:
+                                if isinstance(lu, dict):
+                                    u_id = str(lu.get("id") or lu.get("user_id") or "")
+                                    if u_id and u_id != owner_id:
+                                        rival_user_ids.add(u_id)
 
                         candidates = []
                         for rival_id in rival_user_ids:
@@ -126,18 +179,21 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                                 if candidate_handle.lower() not in [c.lower() for c in candidates]:
                                     candidates.append(candidate_handle)
 
+                        print(f"[COHOST] Rivals found: {rival_user_ids} -> Candidate handles: {candidates}", flush=True)
+
                         for cohost in candidates:
                             if cohost.lower() not in prompted_hosts:
                                 prompted_hosts.add(cohost.lower())
+                                print(f"[COHOST] Notifying client of co-host: @{cohost}", flush=True)
                                 await ws.send_json({
                                     "event": "cohost_detected",
                                     "handle": cohost
                                 })
 
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[COHOST ERROR] {e}", flush=True)
 
-            await asyncio.sleep(8)
+            await asyncio.sleep(6)
 
 async def websocket_handler(request):
     origin = request.headers.get("Origin", "")
