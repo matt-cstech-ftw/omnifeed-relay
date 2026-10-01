@@ -79,7 +79,6 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
     prompted_hosts = set()
     clean_lower = handle.lower().replace("@", "").strip()
 
-    # Wait for the client to complete handshake
     for _ in range(30):
         if client.connected:
             break
@@ -101,7 +100,6 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
             try:
                 url = f"https://webcast.tiktok.com/webcast/room/info/?room_id={room_id}&aid=1988"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    print(f"[COHOST-POLL] Status: {resp.status}", flush=True)
                     if resp.status == 200:
                         raw_body = await resp.text()
                         parsed = json.loads(raw_body)
@@ -110,40 +108,45 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                         owner_id = str(data.get("owner", {}).get("id") or data.get("owner_user_id") or "")
                         link_mic = data.get("link_mic") or data.get("linkMic") or {}
 
-                        # Diagnostic print: let's see what keys exist under link_mic
-                        lm_keys = list(link_mic.keys()) if isinstance(link_mic, dict) else "None"
-                        print(f"[COHOST-POLL] link_mic keys: {lm_keys} | raw size: {len(raw_body)}", flush=True)
+                        # Detailed diagnostic snapshot of link_mic values
+                        print(f"--- [DIAGNOSTIC SNAPSHOT] ---", flush=True)
+                        print(f"owner_id: {owner_id}", flush=True)
+                        print(f"rival_anchor_id: {link_mic.get('rival_anchor_id')}", flush=True)
+                        print(f"linked_user_list: {json.dumps(link_mic.get('linked_user_list'))}", flush=True)
+                        print(f"show_user_list: {json.dumps(link_mic.get('show_user_list'))}", flush=True)
+                        print(f"channel_info: {json.dumps(link_mic.get('channel_info'))}", flush=True)
+                        print(f"battle_scores: {json.dumps(link_mic.get('battle_scores'))}", flush=True)
 
                         rival_user_ids = set()
 
-                        # 1. Battle scores
-                        battle_scores = link_mic.get("battle_scores") or link_mic.get("battleScores") or []
-                        if isinstance(battle_scores, list):
-                            for score_entry in battle_scores:
-                                if isinstance(score_entry, dict):
-                                    u_id = str(score_entry.get("user_id") or score_entry.get("userId") or "")
-                                    if u_id and u_id != owner_id:
-                                        rival_user_ids.add(u_id)
+                        # 1. Direct rival anchor ID
+                        rival_anchor_id = str(link_mic.get("rival_anchor_id") or link_mic.get("rivalAnchorId") or "")
+                        if rival_anchor_id and rival_anchor_id not in ("0", owner_id):
+                            rival_user_ids.add(rival_anchor_id)
 
-                        # 2. Rival users
-                        rival_users = link_mic.get("rival_users") or link_mic.get("rivalUsers") or []
-                        if isinstance(rival_users, list):
-                            for ru in rival_users:
-                                if isinstance(ru, dict):
-                                    u_id = str(ru.get("id") or ru.get("user_id") or "")
-                                    if u_id and u_id != owner_id:
-                                        rival_user_ids.add(u_id)
+                        # 2. Linked user list recursive check
+                        def extract_uids(item):
+                            if isinstance(item, dict):
+                                for k in ("user_id", "id", "userId", "uid", "anchor_id"):
+                                    v = str(item.get(k) or "")
+                                    if v and v not in ("0", owner_id) and v.isdigit():
+                                        rival_user_ids.add(v)
+                                if "user" in item and isinstance(item["user"], dict):
+                                    extract_uids(item["user"])
+                            elif isinstance(item, list):
+                                for x in item:
+                                    extract_uids(x)
+                            elif isinstance(item, (int, str)):
+                                s = str(item)
+                                if s and s not in ("0", owner_id) and s.isdigit():
+                                    rival_user_ids.add(s)
 
-                        # 3. Linked users
-                        linked_users = link_mic.get("linked_users") or link_mic.get("linkedUsers") or []
-                        if isinstance(linked_users, list):
-                            for lu in linked_users:
-                                if isinstance(lu, dict):
-                                    u_id = str(lu.get("id") or lu.get("user_id") or "")
-                                    if u_id and u_id != owner_id:
-                                        rival_user_ids.add(u_id)
+                        extract_uids(link_mic.get("linked_user_list"))
+                        extract_uids(link_mic.get("show_user_list"))
+                        extract_uids(link_mic.get("channel_info"))
+                        extract_uids(link_mic.get("battle_scores"))
 
-                        print(f"[COHOST-POLL] Rival IDs found: {rival_user_ids}", flush=True)
+                        print(f"[COHOST-POLL] Extracted Rival IDs: {rival_user_ids}", flush=True)
 
                         candidates = []
                         for rival_id in rival_user_ids:
