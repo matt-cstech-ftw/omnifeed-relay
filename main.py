@@ -78,14 +78,14 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
     }
     clean_lower = handle.lower().replace("@", "").strip()
 
-    # Wait for the client to complete its initial handshake
+    # Wait for the client to complete its handshake and expose room_id
     for _ in range(30):
         if client.connected:
             break
         await asyncio.sleep(0.5)
 
     room_id = None
-    for _ in range(20):
+    for _ in range(25):
         room_id = find_client_room_id(client)
         if room_id:
             break
@@ -113,9 +113,9 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                         # 1. Battle scores
                         battle_scores = link_mic.get("battle_scores") or link_mic.get("battleScores") or []
                         if isinstance(battle_scores, list):
-                            for score in battle_scores:
-                                if isinstance(score, dict):
-                                    u_id = str(score.get("user_id") or score.get("userId") or "")
+                            for score_entry in battle_scores:
+                                if isinstance(score_entry, dict):
+                                    u_id = str(score_entry.get("user_id") or score_entry.get("userId") or "")
                                     if u_id and u_id != owner_id:
                                         rival_user_ids.add(u_id)
 
@@ -161,7 +161,7 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                         for cohost in candidates:
                             if cohost.lower() not in prompted_hosts:
                                 prompted_hosts.add(cohost.lower())
-                                print(f"[COHOST-DETECTED] Found via Webcast API: @{cohost}", flush=True)
+                                print(f"[COHOST-DETECTED] Emitting @{cohost}", flush=True)
                                 await ws.send_json({
                                     "event": "cohost_detected",
                                     "handle": cohost
@@ -205,36 +205,6 @@ async def websocket_handler(request):
 
                     prompted_hosts.clear()
                     client = TikTokLiveClient(unique_id=handle)
-
-                    # Intercept WebcastLinkLayerMessage raw frame directly
-                    orig_parse = client._parse_webcast_response_message
-                    def intercept_webcast_message(webcast_response_message):
-                        try:
-                            # If this is the co-host / link layer message that crashed pydantic
-                            payload = getattr(webcast_response_message, "payload", b"")
-                            header = getattr(webcast_response_message, "header", b"")
-                            combined = payload + header
-                            if b"WebcastLinkLayerMessage" in combined or b"LinkLayer" in combined:
-                                # Extract usernames via regex on ascii/utf-8 strings in the protobuf
-                                text_dump = combined.decode("latin1", errors="ignore")
-                                potential = re.findall(r'[\w\.-]{3,24}', text_dump)
-                                for cand in potential:
-                                    cand_clean = cand.strip("._-")
-                                    if len(cand_clean) >= 4 and not cand_clean.isdigit():
-                                        if cand_clean.lower() != handle.lower() and "webcast" not in cand_clean.lower():
-                                            if cand_clean.lower() not in prompted_hosts:
-                                                prompted_hosts.add(cand_clean.lower())
-                                                print(f"[COHOST-DETECTED] Intercepted from raw proto frame: @{cand_clean}", flush=True)
-                                                asyncio.create_task(ws.send_json({
-                                                    "event": "cohost_detected",
-                                                    "handle": cand_clean
-                                                }))
-                        except Exception:
-                            pass
-                        # Proceed with normal message parsing
-                        return orig_parse(webcast_response_message)
-
-                    client._parse_webcast_response_message = intercept_webcast_message
 
                     @client.on(ConnectEvent)
                     async def on_connect(event: ConnectEvent):
