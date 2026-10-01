@@ -5,7 +5,7 @@ import asyncio
 import aiohttp
 from aiohttp import web
 from TikTokLive import TikTokLiveClient
-from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent, CustomEvent
+from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 
 AUTH_KEY = os.environ.get("RELAY_AUTH_KEY", "#hogcranked")
 
@@ -54,16 +54,36 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
     prompted_hosts = set()
     clean_lower = handle.lower().replace("@", "").strip()
 
-    for _ in range(30):
-        if client.connected and getattr(client, "room_id", None):
+    # Wait up to 10 seconds for connection
+    for _ in range(20):
+        if client.connected:
             break
         await asyncio.sleep(0.5)
 
-    room_id = getattr(client, "room_id", None)
-    if not room_id:
+    if not client.connected:
         return
 
+    # Extract room_id from available client attributes
+    room_id = getattr(client, "room_id", None)
+    if not room_id and hasattr(client, "room_info") and isinstance(client.room_info, dict):
+        room_id = client.room_info.get("room_id") or client.room_info.get("id")
+
     async with aiohttp.ClientSession(headers=headers) as session:
+        # Fallback to webpage extraction if client didn't expose room_id
+        if not room_id:
+            try:
+                async with session.get(f"https://www.tiktok.com/@{clean_lower}/live", timeout=aiohttp.ClientTimeout(total=4)) as r:
+                    if r.status == 200:
+                        txt = await r.text()
+                        m = re.search(r'"roomId":"(\d+)"', txt)
+                        if m:
+                            room_id = m.group(1)
+            except Exception:
+                pass
+
+        if not room_id:
+            return
+
         while client.connected and not ws.closed:
             try:
                 url = f"https://webcast.tiktok.com/webcast/room/info/?room_id={room_id}&aid=1988"
@@ -117,7 +137,7 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
             except Exception:
                 pass
 
-            await asyncio.sleep(6)
+            await asyncio.sleep(8)
 
 async def websocket_handler(request):
     origin = request.headers.get("Origin", "")
@@ -134,7 +154,6 @@ async def websocket_handler(request):
     client = None
     task = None
     probe_task = None
-    known_cohosts = set()
 
     try:
         async for msg in ws:
@@ -185,25 +204,6 @@ async def websocket_handler(request):
                                 "diamondCount": event.gift.diamond_count,
                                 "host": handle
                             })
-                        except Exception:
-                            pass
-
-                    # Catch raw unparsed events to scrape LinkLayer directly
-                    @client.on(CustomEvent)
-                    async def on_custom(event: CustomEvent):
-                        try:
-                            raw_bytes = getattr(event, "raw_data", b"")
-                            if b"WebcastLinkLayerMessage" in raw_bytes:
-                                text_slice = raw_bytes.decode("latin1", errors="ignore")
-                                user_matches = re.findall(r'([a-zA-Z0-9_\.]{3,24})', text_slice)
-                                for u in user_matches:
-                                    if u.lower() != handle.lower() and u.lower() not in known_cohosts:
-                                        if len(u) >= 4 and not u.isdigit() and "Webcast" not in u:
-                                            known_cohosts.add(u.lower())
-                                            await ws.send_json({
-                                                "event": "cohost_detected",
-                                                "handle": u
-                                            })
                         except Exception:
                             pass
 
