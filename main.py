@@ -12,61 +12,116 @@ AUTH_KEY = os.environ.get("RELAY_AUTH_KEY", "#hogcranked")
 async def health_check(request):
     return web.json_response({"status": "ok", "service": "omnifeed-relay"})
 
-async def check_cohosts(handle: str, ws: web.WebSocketResponse):
-    """Probes TikTok webcast API without CORS barriers and informs the frontend."""
+async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: str) -> str | None:
+    # 1. Webcast profile lookup
+    try:
+        url = f"https://webcast.tiktok.com/webcast/user/profile/?user_id={user_id}&aid=1988"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+            if resp.status == 200:
+                body = await resp.text()
+                try:
+                    parsed = json.loads(body)
+                    user_obj = parsed.get("data", {}).get("user") or parsed.get("user")
+                    if isinstance(user_obj, dict):
+                        h = user_obj.get("display_id") or user_obj.get("unique_id") or user_obj.get("uniqueId")
+                        if h and not str(h).isdigit():
+                            return str(h)
+                except Exception:
+                    pass
+                m = re.search(r'"(?:display_id|unique_id|uniqueId)":\s*"([^"]+)"', body)
+                if m and not m.group(1).isdigit():
+                    return m.group(1)
+    except Exception:
+        pass
+
+    # 2. Web page fallback
+    try:
+        url = f"https://www.tiktok.com/@{user_id}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+            if resp.status == 200:
+                body = await resp.text()
+                m = re.search(r'"uniqueId":"([^"]+)"', body)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+
+    return None
+
+async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSocketResponse):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            # 1. Resolve room ID
-            async with session.get(f"https://www.tiktok.com/@{handle}/live") as resp:
-                text = await resp.text()
-                room_match = re.search(r'"roomId":"(\d+)"', text)
-                if not room_match:
-                    return
-                room_id = room_match.group(1)
+    prompted_hosts = set()
+    clean_lower = handle.lower().replace("@", "").strip()
 
-            # 2. Get room info to extract co-hosts / battle rivals
-            async with session.get(f"https://webcast.tiktok.com/webcast/room/info/?room_id={room_id}&aid=1988") as resp:
-                if resp.status != 200:
-                    return
-                data = await resp.json()
-                room_data = data.get("data", data)
-                owner_id = str(room_data.get("owner", {}).get("id") or room_data.get("owner_user_id", ""))
-                
-                link_mic = room_data.get("link_mic") or room_data.get("linkMic", {})
-                battle_scores = link_mic.get("battle_scores") or link_mic.get("battleScores") or []
-                
-                rival_ids = []
-                for score in battle_scores:
-                    uid = str(score.get("user_id") or score.get("userId") or "")
-                    if uid and uid != owner_id:
-                        rival_ids.append(uid)
+    # Wait for the room_id from the established TikTokLiveClient
+    for _ in range(30):
+        if client.connected and getattr(client, "room_id", None):
+            break
+        await asyncio.sleep(0.5)
 
-                # Search text for user handles matching rival user IDs
-                body_str = json.dumps(room_data)
-                for rival_id in rival_ids:
-                    rival_handle = None
-                    idx = body_str.find(rival_id)
-                    if idx != -1:
-                        start = max(0, idx - 1200)
-                        end = min(len(body_str), idx + 1200)
-                        slice_str = body_str[start:end]
-                        matches = re.findall(r'"(?:display_id|displayId|unique_id|uniqueId)":\s*"([^"]+)"', slice_str)
-                        for m in matches:
-                            if m and not m.isdigit() and m.lower() != handle.lower():
-                                rival_handle = m
-                                break
+    room_id = getattr(client, "room_id", None)
+    if not room_id:
+        return
 
-                    if rival_handle:
-                        await ws.send_json({
-                            "event": "cohost_detected",
-                            "handle": rival_handle
-                        })
-    except Exception:
-        pass
+    async with aiohttp.ClientSession(headers=headers) as session:
+        while client.connected and not ws.closed:
+            try:
+                url = f"https://webcast.tiktok.com/webcast/room/info/?room_id={room_id}&aid=1988"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        raw_body = await resp.text()
+                        parsed = json.loads(raw_body)
+                        data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+
+                        owner_id = str(data.get("owner", {}).get("id") or data.get("owner_user_id") or "")
+                        link_mic = data.get("link_mic") or data.get("linkMic") or {}
+                        battle_scores = link_mic.get("battle_scores") or link_mic.get("battleScores") or []
+
+                        rival_user_ids = []
+                        if isinstance(battle_scores, list):
+                            for score_entry in battle_scores:
+                                if isinstance(score_entry, dict):
+                                    u_id = str(score_entry.get("user_id") or score_entry.get("userId") or "")
+                                    if u_id and u_id != owner_id:
+                                        rival_user_ids.append(u_id)
+
+                        candidates = []
+                        for rival_id in rival_user_ids:
+                            candidate_handle = None
+                            idx = raw_body.find(rival_id)
+                            if idx != -1:
+                                start = max(0, idx - 1200)
+                                end = min(len(raw_body), idx + 1200)
+                                slice_str = raw_body[start:end]
+                                matches = re.findall(r'"(?:display_id|displayId|unique_id|uniqueId)":\s*"([^"]+)"', slice_str)
+                                for c in matches:
+                                    if c and not c.isdigit() and c.lower() != clean_lower:
+                                        candidate_handle = c
+                                        break
+
+                            if not candidate_handle:
+                                candidate_handle = await resolve_handle_from_user_id(session, rival_id)
+
+                            if candidate_handle and candidate_handle.lower() != clean_lower:
+                                if candidate_handle.lower() not in [c.lower() for c in candidates]:
+                                    candidates.append(candidate_handle)
+
+                        for cohost in candidates:
+                            if cohost.lower() not in prompted_hosts:
+                                prompted_hosts.add(cohost.lower())
+                                await ws.send_json({
+                                    "event": "cohost_detected",
+                                    "handle": cohost
+                                })
+
+            except Exception:
+                pass
+
+            # Check every 8 seconds for new battles or invites
+            await asyncio.sleep(8)
 
 async def websocket_handler(request):
     origin = request.headers.get("Origin", "")
@@ -83,6 +138,7 @@ async def websocket_handler(request):
     client = None
     task = None
     probe_task = None
+
     try:
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
@@ -92,6 +148,8 @@ async def websocket_handler(request):
                     if not handle:
                         continue
 
+                    if probe_task:
+                        probe_task.cancel()
                     if client and client.connected:
                         await client.disconnect()
 
@@ -134,8 +192,7 @@ async def websocket_handler(request):
                             pass
 
                     task = asyncio.create_task(client.start())
-                    # Kick off background co-host probe on the server
-                    probe_task = asyncio.create_task(check_cohosts(handle, ws))
+                    probe_task = asyncio.create_task(monitor_cohosts(client, handle, ws))
 
             elif msg.type == web.WSMsgType.ERROR:
                 break
