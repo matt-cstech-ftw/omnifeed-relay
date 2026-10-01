@@ -17,7 +17,6 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
-    # 1. Webcast profile endpoint
     try:
         url = f"https://webcast.tiktok.com/webcast/user/profile/?user_id={user_id}&aid=1988"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -38,7 +37,6 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
     except Exception:
         pass
 
-    # 2. Web page fallback
     try:
         url = f"https://www.tiktok.com/@{user_id}"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -52,67 +50,48 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
 
     return None
 
-def extract_client_room_id(client: TikTokLiveClient) -> str | None:
-    """Extracts room_id regardless of how TikTokLive stores it."""
-    # 1. client.room (standard in v6+)
-    room_obj = getattr(client, "room", None)
-    if room_obj:
-        r_id = getattr(room_obj, "room_id", None) or getattr(room_obj, "id", None)
-        if r_id:
-            return str(r_id)
-        if isinstance(room_obj, dict):
-            r_id = room_obj.get("room_id") or room_obj.get("id")
-            if r_id:
-                return str(r_id)
-
-    # 2. client.room_info
-    room_info = getattr(client, "room_info", None)
-    if isinstance(room_info, dict):
-        r_id = room_info.get("room_id") or room_info.get("id")
-        if r_id:
-            return str(r_id)
-
-    # 3. Direct attributes
-    for attr in ("room_id", "_room_id"):
+def find_client_room_id(client: TikTokLiveClient) -> str | None:
+    for attr in ("_room_id", "room_id"):
         val = getattr(client, attr, None)
         if val:
             return str(val)
-
-    # 4. web client session cache
-    web_obj = getattr(client, "web", None)
-    if web_obj:
-        val = getattr(web_obj, "room_id", None)
+    room = getattr(client, "room", None)
+    if room:
+        val = getattr(room, "id", None) or getattr(room, "room_id", None)
         if val:
             return str(val)
-
+        if isinstance(room, dict):
+            val = room.get("id") or room.get("room_id")
+            if val:
+                return str(val)
+    room_info = getattr(client, "room_info", None)
+    if isinstance(room_info, dict):
+        val = room_info.get("id") or room_info.get("room_id")
+        if val:
+            return str(val)
     return None
 
-async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSocketResponse):
+async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSocketResponse, prompted_hosts: set):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
-    prompted_hosts = set()
     clean_lower = handle.lower().replace("@", "").strip()
 
-    # Wait up to 15 seconds for connection
+    # Wait for the client to complete its initial handshake
     for _ in range(30):
         if client.connected:
             break
         await asyncio.sleep(0.5)
 
-    if not client.connected:
-        return
-
-    # Keep polling room_id if not immediately ready
     room_id = None
     for _ in range(20):
-        room_id = extract_client_room_id(client)
+        room_id = find_client_room_id(client)
         if room_id:
             break
         await asyncio.sleep(0.5)
 
-    print(f"[COHOST] Monitoring started for @{clean_lower}. Room ID: {room_id}", flush=True)
+    print(f"[COHOST-MONITOR] Resolved Room ID for @{clean_lower}: {room_id}", flush=True)
     if not room_id:
         return
 
@@ -134,13 +113,13 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                         # 1. Battle scores
                         battle_scores = link_mic.get("battle_scores") or link_mic.get("battleScores") or []
                         if isinstance(battle_scores, list):
-                            for score_entry in battle_scores:
-                                if isinstance(score_entry, dict):
-                                    u_id = str(score_entry.get("user_id") or score_entry.get("userId") or "")
+                            for score in battle_scores:
+                                if isinstance(score, dict):
+                                    u_id = str(score.get("user_id") or score.get("userId") or "")
                                     if u_id and u_id != owner_id:
                                         rival_user_ids.add(u_id)
 
-                        # 2. Co-host user list / rival users (Co-host box mode)
+                        # 2. Rival users
                         rival_users = link_mic.get("rival_users") or link_mic.get("rivalUsers") or []
                         if isinstance(rival_users, list):
                             for ru in rival_users:
@@ -179,19 +158,17 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                                 if candidate_handle.lower() not in [c.lower() for c in candidates]:
                                     candidates.append(candidate_handle)
 
-                        print(f"[COHOST] Rivals found: {rival_user_ids} -> Candidate handles: {candidates}", flush=True)
-
                         for cohost in candidates:
                             if cohost.lower() not in prompted_hosts:
                                 prompted_hosts.add(cohost.lower())
-                                print(f"[COHOST] Notifying client of co-host: @{cohost}", flush=True)
+                                print(f"[COHOST-DETECTED] Found via Webcast API: @{cohost}", flush=True)
                                 await ws.send_json({
                                     "event": "cohost_detected",
                                     "handle": cohost
                                 })
 
             except Exception as e:
-                print(f"[COHOST ERROR] {e}", flush=True)
+                print(f"[COHOST-PROBE ERROR] {e}", flush=True)
 
             await asyncio.sleep(6)
 
@@ -210,6 +187,7 @@ async def websocket_handler(request):
     client = None
     task = None
     probe_task = None
+    prompted_hosts = set()
 
     try:
         async for msg in ws:
@@ -225,7 +203,38 @@ async def websocket_handler(request):
                     if client and client.connected:
                         await client.disconnect()
 
+                    prompted_hosts.clear()
                     client = TikTokLiveClient(unique_id=handle)
+
+                    # Intercept WebcastLinkLayerMessage raw frame directly
+                    orig_parse = client._parse_webcast_response_message
+                    def intercept_webcast_message(webcast_response_message):
+                        try:
+                            # If this is the co-host / link layer message that crashed pydantic
+                            payload = getattr(webcast_response_message, "payload", b"")
+                            header = getattr(webcast_response_message, "header", b"")
+                            combined = payload + header
+                            if b"WebcastLinkLayerMessage" in combined or b"LinkLayer" in combined:
+                                # Extract usernames via regex on ascii/utf-8 strings in the protobuf
+                                text_dump = combined.decode("latin1", errors="ignore")
+                                potential = re.findall(r'[\w\.-]{3,24}', text_dump)
+                                for cand in potential:
+                                    cand_clean = cand.strip("._-")
+                                    if len(cand_clean) >= 4 and not cand_clean.isdigit():
+                                        if cand_clean.lower() != handle.lower() and "webcast" not in cand_clean.lower():
+                                            if cand_clean.lower() not in prompted_hosts:
+                                                prompted_hosts.add(cand_clean.lower())
+                                                print(f"[COHOST-DETECTED] Intercepted from raw proto frame: @{cand_clean}", flush=True)
+                                                asyncio.create_task(ws.send_json({
+                                                    "event": "cohost_detected",
+                                                    "handle": cand_clean
+                                                }))
+                        except Exception:
+                            pass
+                        # Proceed with normal message parsing
+                        return orig_parse(webcast_response_message)
+
+                    client._parse_webcast_response_message = intercept_webcast_message
 
                     @client.on(ConnectEvent)
                     async def on_connect(event: ConnectEvent):
@@ -264,7 +273,7 @@ async def websocket_handler(request):
                             pass
 
                     task = asyncio.create_task(client.start())
-                    probe_task = asyncio.create_task(monitor_cohosts(client, handle, ws))
+                    probe_task = asyncio.create_task(monitor_cohosts(client, handle, ws, prompted_hosts))
 
             elif msg.type == web.WSMsgType.ERROR:
                 break
