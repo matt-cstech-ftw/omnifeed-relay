@@ -17,6 +17,7 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
+    # 1. Webcast profile lookup
     try:
         url = f"https://webcast.tiktok.com/webcast/user/profile/?user_id={user_id}&aid=1988"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -37,6 +38,7 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
     except Exception:
         pass
 
+    # 2. Public profile web page fallback
     try:
         url = f"https://www.tiktok.com/@{user_id}"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -71,14 +73,15 @@ def find_client_room_id(client: TikTokLiveClient) -> str | None:
             return str(val)
     return None
 
-async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSocketResponse, prompted_hosts: set):
+async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSocketResponse):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
+    prompted_hosts = set()
     clean_lower = handle.lower().replace("@", "").strip()
 
-    # Wait for the client to complete its handshake and expose room_id
+    # Wait for the client to complete handshake
     for _ in range(30):
         if client.connected:
             break
@@ -187,7 +190,6 @@ async def websocket_handler(request):
     client = None
     task = None
     probe_task = None
-    prompted_hosts = set()
 
     try:
         async for msg in ws:
@@ -203,7 +205,6 @@ async def websocket_handler(request):
                     if client and client.connected:
                         await client.disconnect()
 
-                    prompted_hosts.clear()
                     client = TikTokLiveClient(unique_id=handle)
 
                     @client.on(ConnectEvent)
@@ -243,7 +244,7 @@ async def websocket_handler(request):
                             pass
 
                     task = asyncio.create_task(client.start())
-                    probe_task = asyncio.create_task(monitor_cohosts(client, handle, ws, prompted_hosts))
+                    probe_task = asyncio.create_task(monitor_cohosts(client, handle, ws))
 
             elif msg.type == web.WSMsgType.ERROR:
                 break
