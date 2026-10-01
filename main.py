@@ -17,7 +17,6 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
-    # 1. Webcast profile lookup
     try:
         url = f"https://webcast.tiktok.com/webcast/user/profile/?user_id={user_id}&aid=1988"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -38,7 +37,6 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
     except Exception:
         pass
 
-    # 2. Public profile web page fallback
     try:
         url = f"https://www.tiktok.com/@{user_id}"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -103,6 +101,7 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
             try:
                 url = f"https://webcast.tiktok.com/webcast/room/info/?room_id={room_id}&aid=1988"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    print(f"[COHOST-POLL] Status: {resp.status}", flush=True)
                     if resp.status == 200:
                         raw_body = await resp.text()
                         parsed = json.loads(raw_body)
@@ -110,6 +109,10 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
 
                         owner_id = str(data.get("owner", {}).get("id") or data.get("owner_user_id") or "")
                         link_mic = data.get("link_mic") or data.get("linkMic") or {}
+
+                        # Diagnostic print: let's see what keys exist under link_mic
+                        lm_keys = list(link_mic.keys()) if isinstance(link_mic, dict) else "None"
+                        print(f"[COHOST-POLL] link_mic keys: {lm_keys} | raw size: {len(raw_body)}", flush=True)
 
                         rival_user_ids = set()
 
@@ -140,6 +143,8 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                                     if u_id and u_id != owner_id:
                                         rival_user_ids.add(u_id)
 
+                        print(f"[COHOST-POLL] Rival IDs found: {rival_user_ids}", flush=True)
+
                         candidates = []
                         for rival_id in rival_user_ids:
                             candidate_handle = None
@@ -160,6 +165,8 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                             if candidate_handle and candidate_handle.lower() != clean_lower:
                                 if candidate_handle.lower() not in [c.lower() for c in candidates]:
                                     candidates.append(candidate_handle)
+
+                        print(f"[COHOST-POLL] Resolved candidates: {candidates}", flush=True)
 
                         for cohost in candidates:
                             if cohost.lower() not in prompted_hosts:
