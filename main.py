@@ -14,9 +14,11 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_ALERT_WEBHOOK", "")
 
 RESOLVED_CACHE = {}
 ACTIVE_CLIENTS = set()
-ACTIVE_TRACKED_HANDLES = set()
+WS_HOST_MAP = {}  # ws -> handle
 
-# Telemetry stats for daily digests
+# Concurrency semaphore: limits simultaneous outbound HTTP profile lookups to 2
+RESOLVE_SEMAPHORE = asyncio.Semaphore(2)
+
 LIFETIME_CONNECTIONS = 0
 PEAK_CONCURRENT_USERS = 0
 
@@ -52,7 +54,6 @@ async def daily_report_worker(app):
     global PEAK_CONCURRENT_USERS
     try:
         while True:
-            # Sleep 24 hours (86400 seconds)
             await asyncio.sleep(86400)
             mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
             active_now = len(ACTIVE_CLIENTS)
@@ -66,7 +67,6 @@ async def daily_report_worker(app):
                 f"**Cached User IDs:** `{len(RESOLVED_CACHE)}`",
                 0x00E5FF
             )
-            # Reset peak counter for the next 24-hour cycle
             PEAK_CONCURRENT_USERS = active_now
     except asyncio.CancelledError:
         pass
@@ -96,7 +96,7 @@ async def evaluate_system_health():
         asyncio.create_task(send_discord_alert(
             "🔥 Peak Concurrency Warning (25+ Users)",
             f"**Active Clients:** `{active_count}`\n"
-            f"**Tracked TikTok Streams:** `{len(ACTIVE_TRACKED_HANDLES)}`\n"
+            f"**Active TikTok Streams:** `{len(set(WS_HOST_MAP.values()))}`\n"
             f"**RAM Usage:** `{mem_mb:.1f} MB`",
             0xFF5500
         ))
@@ -105,7 +105,7 @@ async def evaluate_system_health():
         asyncio.create_task(send_discord_alert(
             "⚠️ Elevated Concurrency Notice (15+ Users)",
             f"**Active Clients:** `{active_count}`\n"
-            f"**Tracked TikTok Streams:** `{len(ACTIVE_TRACKED_HANDLES)}`\n"
+            f"**Active TikTok Streams:** `{len(set(WS_HOST_MAP.values()))}`\n"
             f"**RAM Usage:** `{mem_mb:.1f} MB`",
             0xFFCC00
         ))
@@ -145,16 +145,17 @@ async def stats_handler(request):
     if token != ADMIN_KEY:
         return web.Response(status=401, text="Unauthorized: Invalid Admin Token", headers=CORS_HEADERS)
 
+    active_streams = list(set(WS_HOST_MAP.values()))
     mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     return web.json_response({
         "status": "ok",
         "concurrent_ws_clients": len(ACTIVE_CLIENTS),
-        "active_tiktok_streams": len(ACTIVE_TRACKED_HANDLES),
+        "active_tiktok_streams": len(active_streams),
         "cached_user_ids": len(RESOLVED_CACHE),
         "peak_today": PEAK_CONCURRENT_USERS,
         "lifetime_connections": LIFETIME_CONNECTIONS,
         "memory_usage_mb": round(mem_mb, 2),
-        "tracked_handles": list(ACTIVE_TRACKED_HANDLES)
+        "tracked_handles": active_streams
     }, headers=CORS_HEADERS)
 
 async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: str) -> str | None:
@@ -167,7 +168,7 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
     }
     try:
         url = f"https://webcast.tiktok.com/webcast/user/profile/?user_id={user_id}&aid=1988"
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3)) as resp:
             if resp.status == 200:
                 body = await resp.text()
                 try:
@@ -189,7 +190,7 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
 
     try:
         url = f"https://www.tiktok.com/@{user_id}"
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3)) as resp:
             if resp.status == 200:
                 body = await resp.text()
                 m = re.search(r'"uniqueId":"([^"]+)"', body)
@@ -242,7 +243,6 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
             break
         await asyncio.sleep(0.5)
 
-    print(f"[COHOST-MONITOR] Initialized for @{clean_lower}. Room ID: {room_id}", flush=True)
     if not room_id:
         return
 
@@ -250,7 +250,7 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
         while client.connected and not ws.closed:
             try:
                 url = f"https://webcast.tiktok.com/webcast/room/info/?room_id={room_id}&aid=1988"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
                     if resp.status == 200:
                         raw_body = await resp.text()
                         parsed = json.loads(raw_body)
@@ -285,38 +285,37 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                         extract_uids(link_mic.get("show_user_list"))
                         extract_uids(link_mic.get("battle_scores"))
 
-                        for rival_id in rival_user_ids:
-                            candidate_handle = RESOLVED_CACHE.get(rival_id)
+                        async def resolve_candidate(uid):
+                            if uid in RESOLVED_CACHE:
+                                return RESOLVED_CACHE[uid]
+                            idx = raw_body.find(uid)
+                            if idx != -1:
+                                start = max(0, idx - 1200)
+                                end = min(len(raw_body), idx + 1200)
+                                slice_str = raw_body[start:end]
+                                matches = re.findall(r'"(?:display_id|displayId|unique_id|uniqueId)":\s*"([^"]+)"', slice_str)
+                                for c in matches:
+                                    if c and not c.isdigit() and c.lower() != clean_lower:
+                                        RESOLVED_CACHE[uid] = c
+                                        return c
+                            async with RESOLVE_SEMAPHORE:
+                                return await resolve_handle_from_user_id(session, uid)
 
-                            if not candidate_handle:
-                                idx = raw_body.find(rival_id)
-                                if idx != -1:
-                                    start = max(0, idx - 1200)
-                                    end = min(len(raw_body), idx + 1200)
-                                    slice_str = raw_body[start:end]
-                                    matches = re.findall(r'"(?:display_id|displayId|unique_id|uniqueId)":\s*"([^"]+)"', slice_str)
-                                    for c in matches:
-                                        if c and not c.isdigit() and c.lower() != clean_lower:
-                                            candidate_handle = c
-                                            RESOLVED_CACHE[rival_id] = c
-                                            break
+                        resolved_handles = await asyncio.gather(*(resolve_candidate(uid) for uid in rival_user_ids), return_exceptions=True)
 
-                            if not candidate_handle:
-                                candidate_handle = await resolve_handle_from_user_id(session, rival_id)
-
-                            if candidate_handle and candidate_handle.lower() != clean_lower:
+                        for candidate_handle in resolved_handles:
+                            if isinstance(candidate_handle, str) and candidate_handle and candidate_handle.lower() != clean_lower:
                                 if candidate_handle.lower() not in prompted_hosts:
                                     prompted_hosts.add(candidate_handle.lower())
-                                    print(f"[COHOST-DETECTED] Emitting @{candidate_handle}", flush=True)
                                     await ws.send_json({
                                         "event": "cohost_detected",
                                         "handle": candidate_handle
                                     })
 
-            except Exception as e:
-                print(f"[COHOST-PROBE ERROR] {e}", flush=True)
+            except Exception:
+                pass
 
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
 async def websocket_handler(request):
     global LIFETIME_CONNECTIONS
@@ -336,7 +335,6 @@ async def websocket_handler(request):
     LIFETIME_CONNECTIONS += 1
     asyncio.create_task(evaluate_system_health())
 
-    current_handle = None
     client = None
     task = None
     probe_task = None
@@ -346,15 +344,11 @@ async def websocket_handler(request):
             if msg.type == web.WSMsgType.TEXT:
                 data = json.loads(msg.data)
                 if data.get("action") == "connect":
-                    handle = data.get("handle", "").replace("@", "").strip()
+                    handle = data.get("handle", "").replace("@", "").strip().lower()
                     if not handle:
                         continue
 
-                    if current_handle and current_handle in ACTIVE_TRACKED_HANDLES:
-                        ACTIVE_TRACKED_HANDLES.discard(current_handle)
-
-                    current_handle = handle.lower()
-                    ACTIVE_TRACKED_HANDLES.add(current_handle)
+                    WS_HOST_MAP[ws] = handle
 
                     if probe_task:
                         probe_task.cancel()
@@ -408,10 +402,9 @@ async def websocket_handler(request):
         pass
     finally:
         ACTIVE_CLIENTS.discard(ws)
+        WS_HOST_MAP.pop(ws, None)
         asyncio.create_task(evaluate_system_health())
 
-        if current_handle and current_handle in ACTIVE_TRACKED_HANDLES:
-            ACTIVE_TRACKED_HANDLES.discard(current_handle)
         if probe_task:
             probe_task.cancel()
         if task:
