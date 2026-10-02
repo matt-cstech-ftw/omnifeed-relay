@@ -10,18 +10,26 @@ from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 AUTH_KEY = os.environ.get("RELAY_AUTH_KEY", "#hogcranked")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "Flock@1017")
 
-# Global session cache: user_id -> resolved handle
 RESOLVED_CACHE = {}
 ACTIVE_CLIENTS = set()
 ACTIVE_TRACKED_HANDLES = set()
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+}
+
 async def health_check(request):
-    return web.json_response({"status": "ok", "service": "omnifeed-relay"})
+    return web.json_response({"status": "ok", "service": "omnifeed-relay"}, headers=CORS_HEADERS)
+
+async def stats_options_handler(request):
+    return web.Response(status=204, headers=CORS_HEADERS)
 
 async def stats_handler(request):
     token = request.query.get("token", "")
     if token != ADMIN_KEY:
-        return web.Response(status=401, text="Unauthorized: Invalid Admin Token")
+        return web.Response(status=401, text="Unauthorized: Invalid Admin Token", headers=CORS_HEADERS)
 
     return web.json_response({
         "status": "ok",
@@ -29,7 +37,7 @@ async def stats_handler(request):
         "active_tiktok_streams": len(ACTIVE_TRACKED_HANDLES),
         "cached_user_ids": len(RESOLVED_CACHE),
         "tracked_handles": list(ACTIVE_TRACKED_HANDLES)
-    })
+    }, headers=CORS_HEADERS)
 
 async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: str) -> str | None:
     if user_id in RESOLVED_CACHE:
@@ -39,7 +47,6 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
-    # 1. Webcast profile lookup
     try:
         url = f"https://webcast.tiktok.com/webcast/user/profile/?user_id={user_id}&aid=1988"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -62,7 +69,6 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
     except Exception:
         pass
 
-    # 2. Public profile web page fallback
     try:
         url = f"https://www.tiktok.com/@{user_id}"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -106,7 +112,6 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
     prompted_hosts = set()
     clean_lower = handle.lower().replace("@", "").strip()
 
-    # Wait for handshake
     for _ in range(30):
         if client.connected:
             break
@@ -138,12 +143,10 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
 
                         rival_user_ids = set()
 
-                        # 1. Direct rival anchor ID
                         rival_anchor_id = str(link_mic.get("rival_anchor_id") or link_mic.get("rivalAnchorId") or "")
                         if rival_anchor_id and rival_anchor_id not in ("0", owner_id):
                             rival_user_ids.add(rival_anchor_id)
 
-                        # 2. Recursive UID extraction
                         def extract_uids(item):
                             if isinstance(item, dict):
                                 for k in ("user_id", "id", "userId", "uid", "anchor_id"):
@@ -164,7 +167,6 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                         extract_uids(link_mic.get("show_user_list"))
                         extract_uids(link_mic.get("battle_scores"))
 
-                        # Only resolve new/unprompted rivals to protect rate-limits
                         for rival_id in rival_user_ids:
                             candidate_handle = RESOLVED_CACHE.get(rival_id)
 
@@ -201,11 +203,11 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
 async def websocket_handler(request):
     origin = request.headers.get("Origin", "")
     if origin and ("github.io" not in origin and "localhost" not in origin and "127.0.0.1" not in origin):
-        return web.Response(status=403, text="Forbidden")
+        return web.Response(status=403, text="Forbidden", headers=CORS_HEADERS)
 
     token = request.query.get("token", "")
     if token != AUTH_KEY:
-        return web.Response(status=401, text="Unauthorized: Invalid Secret Key")
+        return web.Response(status=401, text="Unauthorized: Invalid Secret Key", headers=CORS_HEADERS)
 
     ws = web.WebSocketResponse(heartbeat=25.0)
     await ws.prepare(request)
@@ -297,6 +299,7 @@ async def websocket_handler(request):
 def create_app():
     app = web.Application()
     app.router.add_get("/", health_check)
+    app.router.add_route("OPTIONS", "/stats", stats_options_handler)
     app.router.add_get("/stats", stats_handler)
     app.router.add_get("/ws", websocket_handler)
     app.router.add_get("", websocket_handler)
