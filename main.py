@@ -8,12 +8,28 @@ from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 
 AUTH_KEY = os.environ.get("RELAY_AUTH_KEY", "#hogcranked")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "Flock@1017")
 
 # Global session cache: user_id -> resolved handle
 RESOLVED_CACHE = {}
+ACTIVE_CLIENTS = set()
+ACTIVE_TRACKED_HANDLES = set()
 
 async def health_check(request):
     return web.json_response({"status": "ok", "service": "omnifeed-relay"})
+
+async def stats_handler(request):
+    token = request.query.get("token", "")
+    if token != ADMIN_KEY:
+        return web.Response(status=401, text="Unauthorized: Invalid Admin Token")
+
+    return web.json_response({
+        "status": "ok",
+        "concurrent_ws_clients": len(ACTIVE_CLIENTS),
+        "active_tiktok_streams": len(ACTIVE_TRACKED_HANDLES),
+        "cached_user_ids": len(RESOLVED_CACHE),
+        "tracked_handles": list(ACTIVE_TRACKED_HANDLES)
+    })
 
 async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: str) -> str | None:
     if user_id in RESOLVED_CACHE:
@@ -180,7 +196,6 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
             except Exception as e:
                 print(f"[COHOST-PROBE ERROR] {e}", flush=True)
 
-            # 10s poll cycle balances live battle discovery with zero rate-limit pressure
             await asyncio.sleep(10)
 
 async def websocket_handler(request):
@@ -195,6 +210,8 @@ async def websocket_handler(request):
     ws = web.WebSocketResponse(heartbeat=25.0)
     await ws.prepare(request)
 
+    ACTIVE_CLIENTS.add(ws)
+    current_handle = None
     client = None
     task = None
     probe_task = None
@@ -207,6 +224,12 @@ async def websocket_handler(request):
                     handle = data.get("handle", "").replace("@", "").strip()
                     if not handle:
                         continue
+
+                    if current_handle and current_handle in ACTIVE_TRACKED_HANDLES:
+                        ACTIVE_TRACKED_HANDLES.discard(current_handle)
+
+                    current_handle = handle.lower()
+                    ACTIVE_TRACKED_HANDLES.add(current_handle)
 
                     if probe_task:
                         probe_task.cancel()
@@ -259,6 +282,9 @@ async def websocket_handler(request):
     except Exception:
         pass
     finally:
+        ACTIVE_CLIENTS.discard(ws)
+        if current_handle and current_handle in ACTIVE_TRACKED_HANDLES:
+            ACTIVE_TRACKED_HANDLES.discard(current_handle)
         if probe_task:
             probe_task.cancel()
         if task:
@@ -271,6 +297,7 @@ async def websocket_handler(request):
 def create_app():
     app = web.Application()
     app.router.add_get("/", health_check)
+    app.router.add_get("/stats", stats_handler)
     app.router.add_get("/ws", websocket_handler)
     app.router.add_get("", websocket_handler)
     return app
