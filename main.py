@@ -19,6 +19,10 @@ WS_HOST_MAP = {}  # ws -> handle
 # Concurrency semaphore: limits simultaneous outbound HTTP profile lookups to 2
 RESOLVE_SEMAPHORE = asyncio.Semaphore(2)
 
+# Safety thresholds for admission gate
+MAX_CLIENTS_CAP = 30
+RAM_CEILING_MB = 430.0
+
 LIFETIME_CONNECTIONS = 0
 PEAK_CONCURRENT_USERS = 0
 
@@ -30,6 +34,13 @@ CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
 }
+
+def get_current_rss_mb() -> float:
+    try:
+        with open("/proc/self/statm") as f:
+            return (int(f.read().split()[1]) * 4096) / (1024 * 1024)
+    except Exception:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 async def send_discord_alert(title: str, description: str, color: int):
     if not DISCORD_WEBHOOK_URL:
@@ -55,7 +66,7 @@ async def daily_report_worker(app):
     try:
         while True:
             await asyncio.sleep(86400)
-            mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            mem_mb = get_current_rss_mb()
             active_now = len(ACTIVE_CLIENTS)
 
             await send_discord_alert(
@@ -78,7 +89,7 @@ async def evaluate_system_health():
     if active_count > PEAK_CONCURRENT_USERS:
         PEAK_CONCURRENT_USERS = active_count
 
-    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    mem_mb = get_current_rss_mb()
     now = asyncio.get_event_loop().time()
 
     if mem_mb >= 420 and (now - LAST_RAM_ALERT > 600):
@@ -126,7 +137,7 @@ async def test_alert_handler(request):
     if token != ADMIN_KEY:
         return web.Response(status=401, text="Unauthorized: Invalid Admin Token", headers=CORS_HEADERS)
 
-    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    mem_mb = get_current_rss_mb()
     await send_discord_alert(
         "🧪 OmniFeed Webhook Test",
         f"Discord webhook connection is verified and operational!\n"
@@ -146,7 +157,7 @@ async def stats_handler(request):
         return web.Response(status=401, text="Unauthorized: Invalid Admin Token", headers=CORS_HEADERS)
 
     active_streams = list(set(WS_HOST_MAP.values()))
-    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    mem_mb = get_current_rss_mb()
     return web.json_response({
         "status": "ok",
         "concurrent_ws_clients": len(ACTIVE_CLIENTS),
@@ -327,6 +338,15 @@ async def websocket_handler(request):
     token = request.query.get("token", "")
     if token != AUTH_KEY:
         return web.Response(status=401, text="Unauthorized: Invalid Secret Key", headers=CORS_HEADERS)
+
+    # Admission control check before WebSocket upgrade
+    current_ram = get_current_rss_mb()
+    if len(ACTIVE_CLIENTS) >= MAX_CLIENTS_CAP or current_ram >= RAM_CEILING_MB:
+        return web.json_response(
+            {"error": "at_capacity", "message": "Server at capacity"},
+            status=503,
+            headers=CORS_HEADERS
+        )
 
     ws = web.WebSocketResponse(heartbeat=25.0)
     await ws.prepare(request)
