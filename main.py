@@ -9,14 +9,21 @@ from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 
 AUTH_KEY = os.environ.get("RELAY_AUTH_KEY", "#hogcranked")
 
+# Global session cache: user_id -> resolved handle
+RESOLVED_CACHE = {}
+
 async def health_check(request):
     return web.json_response({"status": "ok", "service": "omnifeed-relay"})
 
 async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: str) -> str | None:
+    if user_id in RESOLVED_CACHE:
+        return RESOLVED_CACHE[user_id]
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
+    # 1. Webcast profile lookup
     try:
         url = f"https://webcast.tiktok.com/webcast/user/profile/?user_id={user_id}&aid=1988"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -28,15 +35,18 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
                     if isinstance(user_obj, dict):
                         h = user_obj.get("display_id") or user_obj.get("unique_id") or user_obj.get("uniqueId")
                         if h and not str(h).isdigit():
+                            RESOLVED_CACHE[user_id] = str(h)
                             return str(h)
                 except Exception:
                     pass
                 m = re.search(r'"(?:display_id|unique_id|uniqueId)":\s*"([^"]+)"', body)
                 if m and not m.group(1).isdigit():
+                    RESOLVED_CACHE[user_id] = m.group(1)
                     return m.group(1)
     except Exception:
         pass
 
+    # 2. Public profile web page fallback
     try:
         url = f"https://www.tiktok.com/@{user_id}"
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
@@ -44,6 +54,7 @@ async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: s
                 body = await resp.text()
                 m = re.search(r'"uniqueId":"([^"]+)"', body)
                 if m:
+                    RESOLVED_CACHE[user_id] = m.group(1)
                     return m.group(1)
     except Exception:
         pass
@@ -79,6 +90,7 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
     prompted_hosts = set()
     clean_lower = handle.lower().replace("@", "").strip()
 
+    # Wait for handshake
     for _ in range(30):
         if client.connected:
             break
@@ -91,7 +103,7 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
             break
         await asyncio.sleep(0.5)
 
-    print(f"[COHOST-MONITOR] Resolved Room ID for @{clean_lower}: {room_id}", flush=True)
+    print(f"[COHOST-MONITOR] Initialized for @{clean_lower}. Room ID: {room_id}", flush=True)
     if not room_id:
         return
 
@@ -108,15 +120,6 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                         owner_id = str(data.get("owner", {}).get("id") or data.get("owner_user_id") or "")
                         link_mic = data.get("link_mic") or data.get("linkMic") or {}
 
-                        # Detailed diagnostic snapshot of link_mic values
-                        print(f"--- [DIAGNOSTIC SNAPSHOT] ---", flush=True)
-                        print(f"owner_id: {owner_id}", flush=True)
-                        print(f"rival_anchor_id: {link_mic.get('rival_anchor_id')}", flush=True)
-                        print(f"linked_user_list: {json.dumps(link_mic.get('linked_user_list'))}", flush=True)
-                        print(f"show_user_list: {json.dumps(link_mic.get('show_user_list'))}", flush=True)
-                        print(f"channel_info: {json.dumps(link_mic.get('channel_info'))}", flush=True)
-                        print(f"battle_scores: {json.dumps(link_mic.get('battle_scores'))}", flush=True)
-
                         rival_user_ids = set()
 
                         # 1. Direct rival anchor ID
@@ -124,7 +127,7 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
                         if rival_anchor_id and rival_anchor_id not in ("0", owner_id):
                             rival_user_ids.add(rival_anchor_id)
 
-                        # 2. Linked user list recursive check
+                        # 2. Recursive UID extraction
                         def extract_uids(item):
                             if isinstance(item, dict):
                                 for k in ("user_id", "id", "userId", "uid", "anchor_id"):
@@ -143,47 +146,42 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
 
                         extract_uids(link_mic.get("linked_user_list"))
                         extract_uids(link_mic.get("show_user_list"))
-                        extract_uids(link_mic.get("channel_info"))
                         extract_uids(link_mic.get("battle_scores"))
 
-                        print(f"[COHOST-POLL] Extracted Rival IDs: {rival_user_ids}", flush=True)
-
-                        candidates = []
+                        # Only resolve new/unprompted rivals to protect rate-limits
                         for rival_id in rival_user_ids:
-                            candidate_handle = None
-                            idx = raw_body.find(rival_id)
-                            if idx != -1:
-                                start = max(0, idx - 1200)
-                                end = min(len(raw_body), idx + 1200)
-                                slice_str = raw_body[start:end]
-                                matches = re.findall(r'"(?:display_id|displayId|unique_id|uniqueId)":\s*"([^"]+)"', slice_str)
-                                for c in matches:
-                                    if c and not c.isdigit() and c.lower() != clean_lower:
-                                        candidate_handle = c
-                                        break
+                            candidate_handle = RESOLVED_CACHE.get(rival_id)
+
+                            if not candidate_handle:
+                                idx = raw_body.find(rival_id)
+                                if idx != -1:
+                                    start = max(0, idx - 1200)
+                                    end = min(len(raw_body), idx + 1200)
+                                    slice_str = raw_body[start:end]
+                                    matches = re.findall(r'"(?:display_id|displayId|unique_id|uniqueId)":\s*"([^"]+)"', slice_str)
+                                    for c in matches:
+                                        if c and not c.isdigit() and c.lower() != clean_lower:
+                                            candidate_handle = c
+                                            RESOLVED_CACHE[rival_id] = c
+                                            break
 
                             if not candidate_handle:
                                 candidate_handle = await resolve_handle_from_user_id(session, rival_id)
 
                             if candidate_handle and candidate_handle.lower() != clean_lower:
-                                if candidate_handle.lower() not in [c.lower() for c in candidates]:
-                                    candidates.append(candidate_handle)
-
-                        print(f"[COHOST-POLL] Resolved candidates: {candidates}", flush=True)
-
-                        for cohost in candidates:
-                            if cohost.lower() not in prompted_hosts:
-                                prompted_hosts.add(cohost.lower())
-                                print(f"[COHOST-DETECTED] Emitting @{cohost}", flush=True)
-                                await ws.send_json({
-                                    "event": "cohost_detected",
-                                    "handle": cohost
-                                })
+                                if candidate_handle.lower() not in prompted_hosts:
+                                    prompted_hosts.add(candidate_handle.lower())
+                                    print(f"[COHOST-DETECTED] Emitting @{candidate_handle}", flush=True)
+                                    await ws.send_json({
+                                        "event": "cohost_detected",
+                                        "handle": candidate_handle
+                                    })
 
             except Exception as e:
                 print(f"[COHOST-PROBE ERROR] {e}", flush=True)
 
-            await asyncio.sleep(6)
+            # 10s poll cycle balances live battle discovery with zero rate-limit pressure
+            await asyncio.sleep(10)
 
 async def websocket_handler(request):
     origin = request.headers.get("Origin", "")
