@@ -16,7 +16,10 @@ RESOLVED_CACHE = {}
 ACTIVE_CLIENTS = set()
 ACTIVE_TRACKED_HANDLES = set()
 
-# Alert state trackers (0: normal, 1: 15+ users, 2: 25+ users)
+# Telemetry stats for daily digests
+LIFETIME_CONNECTIONS = 0
+PEAK_CONCURRENT_USERS = 0
+
 CURRENT_TIER = 0
 LAST_RAM_ALERT = 0
 
@@ -45,14 +48,39 @@ async def send_discord_alert(title: str, description: str, color: int):
     except Exception:
         pass
 
+async def daily_report_worker(app):
+    global PEAK_CONCURRENT_USERS
+    try:
+        while True:
+            # Sleep 24 hours (86400 seconds)
+            await asyncio.sleep(86400)
+            mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            active_now = len(ACTIVE_CLIENTS)
+
+            await send_discord_alert(
+                "📊 Daily OmniFeed Usage Report",
+                f"**Peak Concurrent Users:** `{PEAK_CONCURRENT_USERS}`\n"
+                f"**Current Active Clients:** `{active_now}`\n"
+                f"**Total Connections Handled:** `{LIFETIME_CONNECTIONS}`\n"
+                f"**Current RAM Usage:** `{mem_mb:.1f} MB / 512 MB`\n"
+                f"**Cached User IDs:** `{len(RESOLVED_CACHE)}`",
+                0x00E5FF
+            )
+            # Reset peak counter for the next 24-hour cycle
+            PEAK_CONCURRENT_USERS = active_now
+    except asyncio.CancelledError:
+        pass
+
 async def evaluate_system_health():
-    global CURRENT_TIER, LAST_RAM_ALERT
+    global CURRENT_TIER, LAST_RAM_ALERT, PEAK_CONCURRENT_USERS
 
     active_count = len(ACTIVE_CLIENTS)
+    if active_count > PEAK_CONCURRENT_USERS:
+        PEAK_CONCURRENT_USERS = active_count
+
     mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     now = asyncio.get_event_loop().time()
 
-    # 1. RAM Usage Check (Threshold: 420MB out of 512MB)
     if mem_mb >= 420 and (now - LAST_RAM_ALERT > 600):
         LAST_RAM_ALERT = now
         asyncio.create_task(send_discord_alert(
@@ -63,7 +91,6 @@ async def evaluate_system_health():
             0xFF0033
         ))
 
-    # 2. Concurrency Escalation & De-escalation
     if active_count >= 25 and CURRENT_TIER < 2:
         CURRENT_TIER = 2
         asyncio.create_task(send_discord_alert(
@@ -94,6 +121,22 @@ async def evaluate_system_health():
 async def health_check(request):
     return web.json_response({"status": "ok", "service": "omnifeed-relay"}, headers=CORS_HEADERS)
 
+async def test_alert_handler(request):
+    token = request.query.get("token", "")
+    if token != ADMIN_KEY:
+        return web.Response(status=401, text="Unauthorized: Invalid Admin Token", headers=CORS_HEADERS)
+
+    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    await send_discord_alert(
+        "🧪 OmniFeed Webhook Test",
+        f"Discord webhook connection is verified and operational!\n"
+        f"**Active Clients:** `{len(ACTIVE_CLIENTS)}`\n"
+        f"**RAM Usage:** `{mem_mb:.1f} MB / 512 MB`\n"
+        f"**Peak Today:** `{PEAK_CONCURRENT_USERS}`",
+        0x00E5FF
+    )
+    return web.json_response({"status": "ok", "message": "Test alert dispatched to Discord"}, headers=CORS_HEADERS)
+
 async def stats_options_handler(request):
     return web.Response(status=204, headers=CORS_HEADERS)
 
@@ -108,6 +151,8 @@ async def stats_handler(request):
         "concurrent_ws_clients": len(ACTIVE_CLIENTS),
         "active_tiktok_streams": len(ACTIVE_TRACKED_HANDLES),
         "cached_user_ids": len(RESOLVED_CACHE),
+        "peak_today": PEAK_CONCURRENT_USERS,
+        "lifetime_connections": LIFETIME_CONNECTIONS,
         "memory_usage_mb": round(mem_mb, 2),
         "tracked_handles": list(ACTIVE_TRACKED_HANDLES)
     }, headers=CORS_HEADERS)
@@ -274,6 +319,8 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
             await asyncio.sleep(10)
 
 async def websocket_handler(request):
+    global LIFETIME_CONNECTIONS
+
     origin = request.headers.get("Origin", "")
     if origin and ("github.io" not in origin and "localhost" not in origin and "127.0.0.1" not in origin):
         return web.Response(status=403, text="Forbidden", headers=CORS_HEADERS)
@@ -286,6 +333,7 @@ async def websocket_handler(request):
     await ws.prepare(request)
 
     ACTIVE_CLIENTS.add(ws)
+    LIFETIME_CONNECTIONS += 1
     asyncio.create_task(evaluate_system_health())
 
     current_handle = None
@@ -373,9 +421,19 @@ async def websocket_handler(request):
 
     return ws
 
+async def start_background_tasks(app):
+    app["daily_report_task"] = asyncio.create_task(daily_report_worker(app))
+
+async def cleanup_background_tasks(app):
+    app["daily_report_task"].cancel()
+    await app["daily_report_task"]
+
 def create_app():
     app = web.Application()
+    app.on_startup.append(start_background_tasks)
+    app.on_cleanup.append(cleanup_background_tasks)
     app.router.add_get("/", health_check)
+    app.router.add_get("/test-alert", test_alert_handler)
     app.router.add_route("OPTIONS", "/stats", stats_options_handler)
     app.router.add_get("/stats", stats_handler)
     app.router.add_get("/ws", websocket_handler)
