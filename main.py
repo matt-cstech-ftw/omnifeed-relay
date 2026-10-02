@@ -2,6 +2,7 @@
 import re
 import json
 import asyncio
+import resource
 import aiohttp
 from aiohttp import web
 from TikTokLive import TikTokLiveClient
@@ -9,16 +10,86 @@ from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 
 AUTH_KEY = os.environ.get("RELAY_AUTH_KEY", "#hogcranked")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "Flock@1017")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_ALERT_WEBHOOK", "")
 
 RESOLVED_CACHE = {}
 ACTIVE_CLIENTS = set()
 ACTIVE_TRACKED_HANDLES = set()
+
+# Alert state trackers (0: normal, 1: 15+ users, 2: 25+ users)
+CURRENT_TIER = 0
+LAST_RAM_ALERT = 0
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
 }
+
+async def send_discord_alert(title: str, description: str, color: int):
+    if not DISCORD_WEBHOOK_URL:
+        return
+    payload = {
+        "username": "OmniFeed Sentinel",
+        "avatar_url": "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/1f50a.png",
+        "embeds": [{
+            "title": title,
+            "description": description,
+            "color": color,
+            "footer": {"text": "OmniFeed Relay Telemetry • Render"}
+        }]
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=4))
+    except Exception:
+        pass
+
+async def evaluate_system_health():
+    global CURRENT_TIER, LAST_RAM_ALERT
+
+    active_count = len(ACTIVE_CLIENTS)
+    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    now = asyncio.get_event_loop().time()
+
+    # 1. RAM Usage Check (Threshold: 420MB out of 512MB)
+    if mem_mb >= 420 and (now - LAST_RAM_ALERT > 600):
+        LAST_RAM_ALERT = now
+        asyncio.create_task(send_discord_alert(
+            "🚨 Critical Relay Memory Usage",
+            f"**RAM:** `{mem_mb:.1f} MB / 512 MB`\n"
+            f"**Active Clients:** `{active_count}`\n"
+            f"Approaching Render container memory ceiling.",
+            0xFF0033
+        ))
+
+    # 2. Concurrency Escalation & De-escalation
+    if active_count >= 25 and CURRENT_TIER < 2:
+        CURRENT_TIER = 2
+        asyncio.create_task(send_discord_alert(
+            "🔥 Peak Concurrency Warning (25+ Users)",
+            f"**Active Clients:** `{active_count}`\n"
+            f"**Tracked TikTok Streams:** `{len(ACTIVE_TRACKED_HANDLES)}`\n"
+            f"**RAM Usage:** `{mem_mb:.1f} MB`",
+            0xFF5500
+        ))
+    elif active_count >= 15 and CURRENT_TIER < 1:
+        CURRENT_TIER = 1
+        asyncio.create_task(send_discord_alert(
+            "⚠️ Elevated Concurrency Notice (15+ Users)",
+            f"**Active Clients:** `{active_count}`\n"
+            f"**Tracked TikTok Streams:** `{len(ACTIVE_TRACKED_HANDLES)}`\n"
+            f"**RAM Usage:** `{mem_mb:.1f} MB`",
+            0xFFCC00
+        ))
+    elif active_count <= 10 and CURRENT_TIER > 0:
+        CURRENT_TIER = 0
+        asyncio.create_task(send_discord_alert(
+            "✅ Traffic Returned to Normal",
+            f"**Active Clients:** `{active_count}`\n"
+            f"**RAM Stable:** `{mem_mb:.1f} MB`",
+            0x00E676
+        ))
 
 async def health_check(request):
     return web.json_response({"status": "ok", "service": "omnifeed-relay"}, headers=CORS_HEADERS)
@@ -31,11 +102,13 @@ async def stats_handler(request):
     if token != ADMIN_KEY:
         return web.Response(status=401, text="Unauthorized: Invalid Admin Token", headers=CORS_HEADERS)
 
+    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     return web.json_response({
         "status": "ok",
         "concurrent_ws_clients": len(ACTIVE_CLIENTS),
         "active_tiktok_streams": len(ACTIVE_TRACKED_HANDLES),
         "cached_user_ids": len(RESOLVED_CACHE),
+        "memory_usage_mb": round(mem_mb, 2),
         "tracked_handles": list(ACTIVE_TRACKED_HANDLES)
     }, headers=CORS_HEADERS)
 
@@ -213,6 +286,8 @@ async def websocket_handler(request):
     await ws.prepare(request)
 
     ACTIVE_CLIENTS.add(ws)
+    asyncio.create_task(evaluate_system_health())
+
     current_handle = None
     client = None
     task = None
@@ -285,6 +360,8 @@ async def websocket_handler(request):
         pass
     finally:
         ACTIVE_CLIENTS.discard(ws)
+        asyncio.create_task(evaluate_system_health())
+
         if current_handle and current_handle in ACTIVE_TRACKED_HANDLES:
             ACTIVE_TRACKED_HANDLES.discard(current_handle)
         if probe_task:
