@@ -8,7 +8,6 @@ from aiohttp import web
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 
-AUTH_KEY = os.environ.get("RELAY_AUTH_KEY", "#hogcranked")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "Flock@1017")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_ALERT_WEBHOOK", "")
 
@@ -16,10 +15,8 @@ RESOLVED_CACHE = {}
 ACTIVE_CLIENTS = set()
 WS_HOST_MAP = {}  # ws -> handle
 
-# Concurrency semaphore: limits simultaneous outbound HTTP profile lookups to 2
 RESOLVE_SEMAPHORE = asyncio.Semaphore(2)
 
-# Safety thresholds for admission gate
 MAX_CLIENTS_CAP = 30
 RAM_CEILING_MB = 430.0
 
@@ -334,10 +331,6 @@ async def websocket_handler(request):
     origin = request.headers.get("Origin", "")
     if origin and ("github.io" not in origin and "localhost" not in origin and "127.0.0.1" not in origin):
         return web.Response(status=403, text="Forbidden", headers=CORS_HEADERS)
-
-    token = request.query.get("token", "")
-    if token != AUTH_KEY:
-        return web.Response(status=401, text="Unauthorized: Invalid Secret Key", headers=CORS_HEADERS)
 
     # Admission control check before WebSocket upgrade
     current_ram = get_current_rss_mb()
