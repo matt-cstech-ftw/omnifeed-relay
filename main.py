@@ -8,7 +8,7 @@ from aiohttp import web
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "Flock@1017")
+ADMIN_KEY = os.environ.get("ADMIN_KEY")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_ALERT_WEBHOOK", "")
 
 RESOLVED_CACHE = {}
