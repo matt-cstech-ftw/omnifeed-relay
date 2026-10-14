@@ -1,6 +1,9 @@
-﻿import os
+﻿
+import os
 import re
 import json
+import hmac
+import hashlib
 import asyncio
 import resource
 import aiohttp
@@ -8,8 +11,31 @@ from aiohttp import web
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, CommentEvent, GiftEvent
 
-ADMIN_KEY = os.environ.get("ADMIN_KEY")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "default-admin-key")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_ALERT_WEBHOOK", "")
+DISCORD_ADMIN_USER_ID = os.environ.get("DISCORD_ADMIN_USER_ID", "710499360298893335")
+
+BLOCKLIST_FILE = "optout_blacklist.json"
+ACTIVE_BLOCKLIST = set()
+
+def load_blocklist():
+    global ACTIVE_BLOCKLIST
+    if os.path.exists(BLOCKLIST_FILE):
+        try:
+            with open(BLOCKLIST_FILE, "r") as f:
+                data = json.load(f)
+                ACTIVE_BLOCKLIST = set(data if isinstance(data, list) else [])
+        except Exception:
+            pass
+
+def save_blocklist():
+    try:
+        with open(BLOCKLIST_FILE, "w") as f:
+            json.dump(list(ACTIVE_BLOCKLIST), f)
+    except Exception:
+        pass
+
+load_blocklist()
 
 RESOLVED_CACHE = {}
 ACTIVE_CLIENTS = set()
@@ -28,9 +54,17 @@ LAST_RAM_ALERT = 0
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
 }
+
+def generate_action_token(handle: str, action: str) -> str:
+    payload = f"{handle.lower()}:{action}:{ADMIN_KEY}".encode()
+    return hmac.new(ADMIN_KEY.encode(), payload, hashlib.sha256).hexdigest()
+
+def verify_action_token(handle: str, action: str, token: str) -> bool:
+    expected = generate_action_token(handle, action)
+    return hmac.compare_digest(expected, token)
 
 def get_current_rss_mb() -> float:
     try:
@@ -39,9 +73,10 @@ def get_current_rss_mb() -> float:
     except Exception:
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
-async def send_discord_alert(title: str, description: str, color: int):
+async def send_discord_alert(title: str, description: str, color: int, ping_admin: bool = False):
     if not DISCORD_WEBHOOK_URL:
         return
+    content = f"🚨 <@{DISCORD_ADMIN_USER_ID}> **New Opt-Out Request!**" if ping_admin else None
     payload = {
         "username": "OmniFeed Sentinel",
         "avatar_url": "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/1f50a.png",
@@ -52,6 +87,9 @@ async def send_discord_alert(title: str, description: str, color: int):
             "footer": {"text": "OmniFeed Relay Telemetry • Render"}
         }]
     }
+    if content:
+        payload["content"] = content
+
     try:
         async with aiohttp.ClientSession() as session:
             await session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=4))
@@ -72,7 +110,8 @@ async def daily_report_worker(app):
                 f"**Current Active Clients:** `{active_now}`\n"
                 f"**Total Connections Handled:** `{LIFETIME_CONNECTIONS}`\n"
                 f"**Current RAM Usage:** `{mem_mb:.1f} MB / 512 MB`\n"
-                f"**Cached User IDs:** `{len(RESOLVED_CACHE)}`",
+                f"**Cached User IDs:** `{len(RESOLVED_CACHE)}`\n"
+                f"**Globally Blocked Creators:** `{len(ACTIVE_BLOCKLIST)}`",
                 0x00E5FF
             )
             PEAK_CONCURRENT_USERS = active_now
@@ -140,7 +179,8 @@ async def test_alert_handler(request):
         f"Discord webhook connection is verified and operational!\n"
         f"**Active Clients:** `{len(ACTIVE_CLIENTS)}`\n"
         f"**RAM Usage:** `{mem_mb:.1f} MB / 512 MB`\n"
-        f"**Peak Today:** `{PEAK_CONCURRENT_USERS}`",
+        f"**Peak Today:** `{PEAK_CONCURRENT_USERS}`\n"
+        f"**Blocked Creators:** `{len(ACTIVE_BLOCKLIST)}`",
         0x00E5FF
     )
     return web.json_response({"status": "ok", "message": "Test alert dispatched to Discord"}, headers=CORS_HEADERS)
@@ -160,11 +200,119 @@ async def stats_handler(request):
         "concurrent_ws_clients": len(ACTIVE_CLIENTS),
         "active_tiktok_streams": len(active_streams),
         "cached_user_ids": len(RESOLVED_CACHE),
+        "blocked_creators": list(ACTIVE_BLOCKLIST),
         "peak_today": PEAK_CONCURRENT_USERS,
         "lifetime_connections": LIFETIME_CONNECTIONS,
         "memory_usage_mb": round(mem_mb, 2),
         "tracked_handles": active_streams
     }, headers=CORS_HEADERS)
+
+async def optout_form_handler(request):
+    html = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OmniFeed Creator Opt-Out</title>
+  <style>
+    body { background: #0f0f14; color: #f0f0f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }
+    .box { background: #161620; border: 1px solid #262636; border-radius: 12px; padding: 28px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    h2 { margin: 0 0 8px 0; font-size: 20px; color: #00e5ff; }
+    p { font-size: 13px; line-height: 1.45; color: #a0a0b2; margin: 0 0 20px 0; }
+    label { font-size: 11px; font-weight: 700; color: #d0d0dd; text-transform: uppercase; letter-spacing: 0.5px; }
+    input[type="text"] { width: 100%; box-sizing: border-box; background: #0a0a0f; border: 1px solid #333344; color: #fff; padding: 10px 12px; border-radius: 6px; font-size: 14px; margin: 6px 0 18px 0; outline: none; }
+    input[type="text"]:focus { border-color: #00e5ff; }
+    button { width: 100%; background: #00e5ff; color: #050508; font-weight: 800; border: none; padding: 12px; border-radius: 6px; font-size: 13px; cursor: pointer; text-transform: uppercase; letter-spacing: 0.5px; }
+    button:hover { background: #26ecff; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>Creator Opt-Out</h2>
+    <p>OmniFeed only aggregates public broadcast telemetry. If you prefer your live stream chat and telemetry not be readable inside OmniFeed aggregator views, enter your handle below to request global exclusion.</p>
+    <form method="POST" action="/optout">
+      <label>TikTok Username / Handle</label>
+      <input type="text" name="handle" placeholder="@yourhandle" required autofocus autocomplete="off" />
+      <button type="submit">Submit Opt-Out Request</button>
+    </form>
+  </div>
+</body>
+</html>"""
+    return web.Response(text=html, content_type="text/html", headers=CORS_HEADERS)
+
+async def optout_submit_handler(request):
+    form_data = await request.post()
+    raw_handle = form_data.get("handle", "").strip()
+    clean_handle = raw_handle.replace("@", "").strip().lower()
+
+    if not clean_handle:
+        return web.Response(text="Invalid handle provided.", status=400, content_type="text/plain")
+
+    approve_token = generate_action_token(clean_handle, "approve")
+    reject_token = generate_action_token(clean_handle, "reject")
+    base_url = "https://omnifeed-relay.onrender.com"
+
+    approve_url = f"{base_url}/optout/action?action=approve&handle={clean_handle}&token={approve_token}"
+    reject_url = f"{base_url}/optout/action?action=reject&handle={clean_handle}&token={reject_token}"
+
+    description = (
+        f"**Streamer Handle:** `@{clean_handle}`\n\n"
+        f"Review creator channel before approving:\n"
+        f"[🔗 Open TikTok Profile](https://www.tiktok.com/@{clean_handle})\n\n"
+        f"**Admin Actions:**\n"
+        f"👉 [✅ Approve & Block Globally]({approve_url})\n"
+        f"👉 [❌ Dismiss / Reject Request]({reject_url})"
+    )
+
+    asyncio.create_task(send_discord_alert(
+        f"Opt-Out Request: @{clean_handle}",
+        description,
+        0xFF0055,
+        ping_admin=True
+    ))
+
+    resp_html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Request Received</title>
+  <style>
+    body {{ background: #0f0f14; color: #f0f0f5; font-family: sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
+    .card {{ background: #161620; border: 1px solid #262636; border-radius: 12px; padding: 28px; max-width: 360px; text-align: center; }}
+    h3 {{ color: #00e5ff; margin-top: 0; }}
+    p {{ font-size: 13px; color: #a0a0b2; line-height: 1.4; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h3>Request Received</h3>
+    <p>Your opt-out request for <strong>@{clean_handle}</strong> has been logged for review. Exclusion takes effect globally upon approval.</p>
+  </div>
+</body>
+</html>"""
+    return web.Response(text=resp_html, content_type="text/html", headers=CORS_HEADERS)
+
+async def optout_action_handler(request):
+    action = request.query.get("action", "").lower()
+    handle = request.query.get("handle", "").replace("@", "").strip().lower()
+    token = request.query.get("token", "")
+
+    if not handle or not action or not token:
+        return web.Response(text="Missing parameters", status=400, content_type="text/plain")
+
+    if not verify_action_token(handle, action, token):
+        return web.Response(text="Unauthorized: Invalid or expired action token", status=403, content_type="text/plain")
+
+    if action == "approve":
+        ACTIVE_BLOCKLIST.add(handle)
+        save_blocklist()
+        msg = f"@{handle} is now globally blocked on OmniFeed."
+    else:
+        ACTIVE_BLOCKLIST.discard(handle)
+        save_blocklist()
+        msg = f"Opt-out request for @{handle} was dismissed / removed."
+
+    return web.Response(text=f"<h3>{msg}</h3>", content_type="text/html")
 
 async def resolve_handle_from_user_id(session: aiohttp.ClientSession, user_id: str) -> str | None:
     if user_id in RESOLVED_CACHE:
@@ -313,8 +461,9 @@ async def monitor_cohosts(client: TikTokLiveClient, handle: str, ws: web.WebSock
 
                         for candidate_handle in resolved_handles:
                             if isinstance(candidate_handle, str) and candidate_handle and candidate_handle.lower() != clean_lower:
-                                if candidate_handle.lower() not in prompted_hosts:
-                                    prompted_hosts.add(candidate_handle.lower())
+                                cand_clean = candidate_handle.lower()
+                                if cand_clean not in prompted_hosts and cand_clean not in ACTIVE_BLOCKLIST:
+                                    prompted_hosts.add(cand_clean)
                                     await ws.send_json({
                                         "event": "cohost_detected",
                                         "handle": candidate_handle
@@ -332,7 +481,6 @@ async def websocket_handler(request):
     if origin and ("github.io" not in origin and "localhost" not in origin and "127.0.0.1" not in origin):
         return web.Response(status=403, text="Forbidden", headers=CORS_HEADERS)
 
-    # Admission control check before WebSocket upgrade
     current_ram = get_current_rss_mb()
     if len(ACTIVE_CLIENTS) >= MAX_CLIENTS_CAP or current_ram >= RAM_CEILING_MB:
         return web.json_response(
@@ -359,6 +507,14 @@ async def websocket_handler(request):
                 if data.get("action") == "connect":
                     handle = data.get("handle", "").replace("@", "").strip().lower()
                     if not handle:
+                        continue
+
+                    if handle in ACTIVE_BLOCKLIST:
+                        await ws.send_json({
+                            "event": "error",
+                            "code": 403,
+                            "message": f"@{handle} has requested not to be aggregated on OmniFeed."
+                        })
                         continue
 
                     WS_HOST_MAP[ws] = handle
@@ -442,6 +598,9 @@ def create_app():
     app.router.add_get("/test-alert", test_alert_handler)
     app.router.add_route("OPTIONS", "/stats", stats_options_handler)
     app.router.add_get("/stats", stats_handler)
+    app.router.add_get("/optout", optout_form_handler)
+    app.router.add_post("/optout", optout_submit_handler)
+    app.router.add_get("/optout/action", optout_action_handler)
     app.router.add_get("/ws", websocket_handler)
     app.router.add_get("", websocket_handler)
     return app
