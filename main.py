@@ -1,5 +1,4 @@
-﻿
-import os
+﻿import os
 import re
 import json
 import hmac
@@ -521,6 +520,8 @@ async def websocket_handler(request):
 
                     if probe_task:
                         probe_task.cancel()
+                    if task:
+                        task.cancel()
                     if client and client.connected:
                         await client.disconnect()
 
@@ -562,7 +563,26 @@ async def websocket_handler(request):
                         except Exception:
                             pass
 
-                    task = asyncio.create_task(client.start())
+                    async def run_tiktok(target_handle: str):
+                        try:
+                            await client.start()
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            WS_HOST_MAP.pop(ws, None)
+                            if probe_task and not probe_task.done():
+                                probe_task.cancel()
+                            if not ws.closed:
+                                try:
+                                    await ws.send_json({
+                                        "event": "error",
+                                        "code": 404,
+                                        "message": f"@{target_handle} is offline or could not be found."
+                                    })
+                                except Exception:
+                                    pass
+
+                    task = asyncio.create_task(run_tiktok(handle))
                     probe_task = asyncio.create_task(monitor_cohosts(client, handle, ws))
 
             elif msg.type == web.WSMsgType.ERROR:
